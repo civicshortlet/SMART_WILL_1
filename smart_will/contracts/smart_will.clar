@@ -752,3 +752,135 @@
         (ok claim-amount)
     )
 )
+
+;; ===================================================================
+;; READ-ONLY FUNCTIONS
+;; ===================================================================
+
+;; Get comprehensive will information
+;; @param will-id: The will ID to query
+;; @returns: Optional will data with all fields
+(define-read-only (get-will-info (will-id uint))
+    (map-get? wills { will-id: will-id })
+)
+
+;; Get beneficiary allocation and claim status
+;; @param will-id: The will ID to query
+;; @param beneficiary: The beneficiary's principal address
+;; @returns: Optional beneficiary data (allocation and claimed status)
+(define-read-only (get-beneficiary-info
+        (will-id uint)
+        (beneficiary principal)
+    )
+    (map-get? beneficiary-allocations {
+        will-id: will-id,
+        beneficiary: beneficiary,
+    })
+)
+
+;; Get will ID for an owner (one will per owner)
+;; @param owner: The owner's principal address
+;; @returns: Optional will ID
+(define-read-only (get-owner-will-id (owner principal))
+    (map-get? owner-will-mapping { owner: owner })
+)
+
+;; Check if release condition is met for a will
+;; @param will-id: The will ID to check
+;; @returns: true if current block >= release block, false otherwise
+(define-read-only (is-release-condition-met (will-id uint))
+    (match (get-will-data will-id)
+        will-data (>= stacks-block-height (get release-block-height will-data))
+        false
+    )
+)
+
+;; Get current global will counter
+;; @returns: The number of wills created so far
+(define-read-only (get-will-counter)
+    (var-get will-counter)
+)
+
+;; Check if a beneficiary can claim their allocation
+;; @param will-id: The will ID to check
+;; @param beneficiary: The beneficiary's principal address
+;; @returns: true if beneficiary can claim, false otherwise
+;;
+;; Conditions for claiming:
+;; - Will must be active (not cancelled)
+;; - Release block height must be reached
+;; - Beneficiary must exist and not have claimed yet
+(define-read-only (can-claim
+        (will-id uint)
+        (beneficiary principal)
+    )
+    (match (get-will-data will-id)
+        will-data (match (map-get? beneficiary-allocations {
+            will-id: will-id,
+            beneficiary: beneficiary,
+        })
+            beneficiary-data (and
+                (is-will-active will-id)
+                (>= stacks-block-height (get release-block-height will-data))
+                (not (get claimed beneficiary-data))
+            )
+            false
+        )
+        false
+    )
+)
+
+;; Get will statistics and status
+;; @param will-id: The will ID to analyze
+;; @returns: Optional tuple with comprehensive will statistics
+(define-read-only (get-will-stats (will-id uint))
+    (match (get-will-data will-id)
+        will-data (some {
+            will-id: will-id,
+            owner: (get owner will-data),
+            is-active: (is-will-active will-id),
+            release-block-height: (get release-block-height will-data),
+            blocks-until-release: (if (>= stacks-block-height (get release-block-height will-data))
+                u0
+                (- (get release-block-height will-data) stacks-block-height)
+            ),
+            total-allocation: (get total-allocation will-data),
+            total-claimed: (get total-claimed will-data),
+            remaining-balance: (- (get total-allocation will-data) (get total-claimed will-data)),
+            beneficiary-count: (get beneficiary-count will-data),
+            created-block: (get created-block will-data),
+            can-be-claimed: (>= stacks-block-height (get release-block-height will-data)),
+        })
+        none
+    )
+)
+
+;; Check contract's STX balance
+;; @returns: Current STX balance held by the contract
+(define-read-only (get-contract-balance)
+    (stx-get-balance (as-contract tx-sender))
+)
+
+;; Get latest event data for debugging/monitoring
+(define-read-only (get-last-will-created-event)
+    (var-get last-will-created-event)
+)
+
+(define-read-only (get-last-will-updated-event)
+    (var-get last-will-updated-event)
+)
+
+(define-read-only (get-last-will-cancelled-event)
+    (var-get last-will-cancelled-event)
+)
+
+(define-read-only (get-last-claim-event)
+    (var-get last-claim-event)
+)
+
+;; Validate if a principal list has duplicates (utility function)
+;; @param principals: List of principals to check
+;; @returns: true if duplicates found, false otherwise
+(define-read-only (validate-no-duplicates (principals (list 50 principal)))
+    (has-duplicate-beneficiaries principals)
+)
