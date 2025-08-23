@@ -359,3 +359,396 @@
         })
     )
 )
+
+;; ===================================================================
+;; PUBLIC FUNCTIONS
+;; ===================================================================
+
+;; Create a new will with beneficiaries and allocations
+;; @param beneficiaries: List of beneficiary principals (max 50)
+;; @param allocations: List of STX amounts for each beneficiary
+;; @param release-block-height: Block number when claims become available
+;; @returns: Result containing the new will ID
+;;
+;; Security checks:
+;; - Caller must not already have an active will
+;; - Release block must be in the future
+;; - All allocations must be positive
+;; - Caller must have sufficient STX balance
+;; - Lists must have same length and no duplicates
+;;
+;; Post-conditions:
+;; - STX transferred to contract
+;; - Will created with all data stored
+;; - Event logged
+(define-public (create-will
+        (beneficiaries (list 50 principal))
+        (allocations (list 50 uint))
+        (release-block-height uint)
+    )
+    (let (
+            (caller tx-sender)
+            (current-block stacks-block-height)
+            (new-will-id (+ (var-get will-counter) u1))
+            (beneficiary-count (len beneficiaries))
+            (total-allocation-result (calculate-total-allocation beneficiaries allocations))
+            (total-allocation (unwrap! total-allocation-result ERR_INVALID_ALLOCATION))
+        )
+        ;; === PRE-CONDITION VALIDATION ===
+
+        ;; Block height validation
+        (asserts! (> release-block-height current-block)
+            ERR_INVALID_RELEASE_BLOCK
+        )
+
+        ;; Beneficiary validation
+        (asserts! (> beneficiary-count u0) ERR_INVALID_BENEFICIARY)
+        (asserts! (<= beneficiary-count MAX_BENEFICIARIES)
+            ERR_INVALID_BENEFICIARY
+        )
+        (asserts! (is-eq beneficiary-count (len allocations))
+            ERR_INVALID_ALLOCATION
+        )
+
+        ;; Allocation validation
+        (asserts! (> total-allocation u0) ERR_INVALID_ALLOCATION)
+        (asserts! (is-eq (len (filter is-zero-allocation allocations)) u0)
+            ERR_ZERO_ALLOCATION
+        )
+
+        ;; Caller validation
+        (asserts! (is-none (map-get? owner-will-mapping { owner: caller }))
+            ERR_WILL_ALREADY_EXISTS
+        )
+        (asserts! (>= (stx-get-balance caller) total-allocation)
+            ERR_INSUFFICIENT_BALANCE
+        )
+
+        ;; === ASSET TRANSFER ===
+        ;; Transfer STX from caller to contract (held in escrow)
+        (try! (stx-transfer? total-allocation caller (as-contract tx-sender)))
+
+        ;; === STATE UPDATES ===
+
+        ;; Create the will record
+        (map-set wills { will-id: new-will-id } {
+            owner: caller,
+            release-block-height: release-block-height,
+            total-allocation: total-allocation,
+            total-claimed: u0,
+            beneficiary-count: beneficiary-count,
+            is-cancelled: false,
+            created-block: current-block,
+        })
+
+        ;; Map owner to will for quick lookup
+        (map-set owner-will-mapping { owner: caller } { will-id: new-will-id })
+
+        ;; Add all beneficiaries with their allocations
+        (try! (add-beneficiaries-internal new-will-id beneficiaries allocations))
+
+        ;; Update global will counter
+        (var-set will-counter new-will-id)
+
+        ;; === EVENT LOGGING ===
+        (log-will-created new-will-id caller total-allocation
+            release-block-height beneficiary-count
+        )
+
+        ;; === POST-CONDITIONS ===
+        ;; Verify will was created successfully
+        (asserts! (is-some (get-will-data new-will-id)) ERR_WILL_NOT_FOUND)
+
+        (ok new-will-id)
+    )
+)
+
+;; Update a beneficiary's allocation (only before release condition)
+;; @param beneficiary: The beneficiary's principal address
+;; @param new-allocation: New STX allocation amount (must be > 0)
+;; @returns: Success result
+;;
+;; Security checks:
+;; - Only will owner can update
+;; - Will must be active (not cancelled)
+;; - Release condition must not be met yet
+;; - New allocation must be positive
+;; - Owner must have sufficient balance for increases
+;;
+;; Post-conditions:
+;; - Beneficiary allocation updated
+;; - STX balance adjusted accordingly
+;; - Event logged
+(define-public (update-beneficiary
+        (beneficiary principal)
+        (new-allocation uint)
+    )
+    (let (
+            (caller tx-sender)
+            (will-mapping (unwrap! (map-get? owner-will-mapping { owner: caller })
+                ERR_WILL_NOT_FOUND
+            ))
+            (will-id (get will-id will-mapping))
+            (will-data (unwrap! (get-will-data will-id) ERR_WILL_NOT_FOUND))
+            (current-block stacks-block-height)
+        )
+        ;; === PRE-CONDITION VALIDATION ===
+        (asserts! (is-will-owner will-id caller) ERR_UNAUTHORIZED)
+        (asserts! (is-will-active will-id) ERR_WILL_CANCELLED)
+        (asserts! (< current-block (get release-block-height will-data))
+            ERR_RELEASE_CONDITION_NOT_MET
+        )
+        (asserts! (> new-allocation u0) ERR_ZERO_ALLOCATION)
+
+        ;; Get current beneficiary allocation (if exists)
+        (let ((current-beneficiary-data (map-get? beneficiary-allocations {
+                will-id: will-id,
+                beneficiary: beneficiary,
+            })))
+            (match current-beneficiary-data
+                ;; === EXISTING BENEFICIARY UPDATE ===
+                beneficiary-data
+                (let (
+                        (old-allocation (get allocation beneficiary-data))
+                        (allocation-diff (if (> new-allocation old-allocation)
+                            (- new-allocation old-allocation)
+                            (- old-allocation new-allocation)
+                        ))
+                        (is-increase (> new-allocation old-allocation))
+                    )
+                    ;; Additional validation for increases
+                    (if is-increase
+                        (asserts! (>= (stx-get-balance caller) allocation-diff)
+                            ERR_INSUFFICIENT_BALANCE
+                        )
+                        true
+                    )
+
+                    ;; === ASSET TRANSFER ===
+                    (if is-increase
+                        ;; Increase: transfer additional STX from owner to contract
+                        (try! (stx-transfer? allocation-diff caller
+                            (as-contract tx-sender)
+                        ))
+                        ;; Decrease: transfer excess STX back to owner
+                        (try! (as-contract (stx-transfer? allocation-diff tx-sender caller)))
+                    )
+
+                    ;; === STATE UPDATES ===
+
+                    ;; Update beneficiary allocation (reset claimed status)
+                    (map-set beneficiary-allocations {
+                        will-id: will-id,
+                        beneficiary: beneficiary,
+                    } {
+                        allocation: new-allocation,
+                        claimed: false,
+                    })
+
+                    ;; Update total allocation in will
+                    (map-set wills { will-id: will-id }
+                        (merge will-data { total-allocation: (if is-increase
+                            (+ (get total-allocation will-data) allocation-diff)
+                            (- (get total-allocation will-data) allocation-diff)
+                        ) }
+                        ))
+
+                    ;; === EVENT LOGGING ===
+                    (log-will-updated will-id caller beneficiary old-allocation
+                        new-allocation
+                    )
+
+                    (ok true)
+                )
+                ;; === NEW BENEFICIARY ADDITION ===
+                (begin
+                    ;; Validate caller has sufficient balance
+                    (asserts! (>= (stx-get-balance caller) new-allocation)
+                        ERR_INSUFFICIENT_BALANCE
+                    )
+
+                    ;; Check beneficiary count limit
+                    (asserts!
+                        (< (get beneficiary-count will-data) MAX_BENEFICIARIES)
+                        ERR_INVALID_BENEFICIARY
+                    )
+
+                    ;; === ASSET TRANSFER ===
+                    ;; Transfer STX for new beneficiary
+                    (try! (stx-transfer? new-allocation caller (as-contract tx-sender)))
+
+                    ;; === STATE UPDATES ===
+
+                    ;; Add new beneficiary
+                    (map-set beneficiary-allocations {
+                        will-id: will-id,
+                        beneficiary: beneficiary,
+                    } {
+                        allocation: new-allocation,
+                        claimed: false,
+                    })
+
+                    ;; Update will totals
+                    (map-set wills { will-id: will-id }
+                        (merge will-data {
+                            total-allocation: (+ (get total-allocation will-data) new-allocation),
+                            beneficiary-count: (+ (get beneficiary-count will-data) u1),
+                        })
+                    )
+
+                    ;; === EVENT LOGGING ===
+                    (log-will-updated will-id caller beneficiary u0
+                        new-allocation
+                    )
+
+                    (ok true)
+                )
+            )
+        )
+    )
+)
+
+;; Cancel the will and withdraw all assets
+;; @returns: Success result
+;;
+;; Security checks:
+;; - Only will owner can cancel
+;; - Will must be active (not already cancelled)
+;; - Contract must have sufficient balance to refund
+;;
+;; Post-conditions:
+;; - Will marked as cancelled
+;; - All STX refunded to owner
+;; - Event logged
+(define-public (cancel-will)
+    (let (
+            (caller tx-sender)
+            (will-mapping (unwrap! (map-get? owner-will-mapping { owner: caller })
+                ERR_WILL_NOT_FOUND
+            ))
+            (will-id (get will-id will-mapping))
+            (will-data (unwrap! (get-will-data will-id) ERR_WILL_NOT_FOUND))
+            (refund-amount (- (get total-allocation will-data) (get total-claimed will-data)))
+        )
+        ;; === PRE-CONDITION VALIDATION ===
+        (asserts! (is-will-owner will-id caller) ERR_UNAUTHORIZED)
+        (asserts! (is-will-active will-id) ERR_WILL_CANCELLED)
+
+        ;; Verify contract has sufficient balance for refund
+        (asserts! (>= (stx-get-balance (as-contract tx-sender)) refund-amount)
+            ERR_INSUFFICIENT_BALANCE
+        )
+
+        ;; === STATE UPDATES ===
+
+        ;; Mark will as cancelled
+        (map-set wills { will-id: will-id }
+            (merge will-data { is-cancelled: true })
+        )
+
+        ;; === ASSET TRANSFER ===
+        ;; Transfer remaining STX back to owner (subtract already claimed amounts)
+        (if (> refund-amount u0)
+            (try! (as-contract (stx-transfer? refund-amount tx-sender caller)))
+            true
+        )
+
+        ;; === EVENT LOGGING ===
+        (log-will-cancelled will-id caller refund-amount)
+
+        ;; === POST-CONDITIONS ===
+        ;; Verify will is now cancelled
+        (asserts! (not (is-will-active will-id)) ERR_WILL_NOT_FOUND)
+
+        (ok refund-amount)
+    )
+)
+
+;; Beneficiaries claim their allocation after release condition is met
+;; @param will-id: The will ID to claim from
+;; @returns: Result containing the claimed amount
+;;
+;; Security checks:
+;; - Will must be active (not cancelled)
+;; - Release block height condition must be met
+;; - Caller must be a valid beneficiary
+;; - Beneficiary must not have already claimed
+;; - Contract must have sufficient balance
+;;
+;; Post-conditions:
+;; - Beneficiary marked as claimed
+;; - STX transferred to beneficiary
+;; - Total claimed amount updated
+;; - Event logged
+(define-public (claim (will-id uint))
+    (let (
+            (caller tx-sender)
+            (will-data (unwrap! (get-will-data will-id) ERR_WILL_NOT_FOUND))
+            (beneficiary-data (unwrap!
+                (map-get? beneficiary-allocations {
+                    will-id: will-id,
+                    beneficiary: caller,
+                })
+                ERR_INVALID_BENEFICIARY
+            ))
+            (current-block stacks-block-height)
+            (claim-amount (get allocation beneficiary-data))
+        )
+        ;; === PRE-CONDITION VALIDATION ===
+
+        ;; Will status validation
+        (asserts! (is-will-active will-id) ERR_WILL_CANCELLED)
+
+        ;; Release condition validation - CRITICAL SECURITY CHECK
+        (asserts! (>= current-block (get release-block-height will-data))
+            ERR_RELEASE_CONDITION_NOT_MET
+        )
+
+        ;; Double-claim prevention - CRITICAL SECURITY CHECK
+        (asserts! (not (get claimed beneficiary-data)) ERR_ALREADY_CLAIMED)
+
+        ;; Contract balance validation
+        (asserts! (>= (stx-get-balance (as-contract tx-sender)) claim-amount)
+            ERR_INSUFFICIENT_BALANCE
+        )
+
+        ;; Ensure claim amount is positive
+        (asserts! (> claim-amount u0) ERR_INVALID_ALLOCATION)
+
+        ;; === STATE UPDATES ===
+
+        ;; Mark beneficiary as claimed
+        (map-set beneficiary-allocations {
+            will-id: will-id,
+            beneficiary: caller,
+        }
+            (merge beneficiary-data { claimed: true })
+        )
+
+        ;; Update total claimed amount in will
+        (map-set wills { will-id: will-id }
+            (merge will-data { total-claimed: (+ (get total-claimed will-data) claim-amount) })
+        )
+
+        ;; === ASSET TRANSFER ===
+        ;; Transfer allocation to beneficiary
+        (try! (as-contract (stx-transfer? claim-amount tx-sender caller)))
+
+        ;; === EVENT LOGGING ===
+        (log-claim-made will-id caller claim-amount)
+
+        ;; === POST-CONDITIONS ===
+        ;; Verify claim was recorded
+        (let ((updated-beneficiary-data (unwrap!
+                (map-get? beneficiary-allocations {
+                    will-id: will-id,
+                    beneficiary: caller,
+                })
+                ERR_WILL_NOT_FOUND
+            )))
+            (asserts! (get claimed updated-beneficiary-data) ERR_ALREADY_CLAIMED)
+        )
+
+        (ok claim-amount)
+    )
+)
