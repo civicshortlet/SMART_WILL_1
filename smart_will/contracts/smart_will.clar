@@ -399,6 +399,11 @@
             ERR_RELEASE_CONDITION_NOT_MET
         )
         (asserts! (> new-allocation u0) ERR_ZERO_ALLOCATION)
+        
+        ;; Validate beneficiary is not contract principal or caller
+        (asserts! (not (is-eq beneficiary (as-contract tx-sender))) ERR_INVALID_BENEFICIARY)
+        (asserts! (not (is-eq beneficiary caller)) ERR_INVALID_BENEFICIARY)
+        
         (let ((current-beneficiary-data (map-get? beneficiary-allocations {
                 will-id: will-id,
                 beneficiary: beneficiary,
@@ -437,8 +442,8 @@
                             (- (get total-allocation will-data) allocation-diff)
                         ) }
                         ))
-                    (log-will-updated will-id caller beneficiary old-allocation
-                        new-allocation
+                    (log-will-updated will-id caller beneficiary
+                        old-allocation new-allocation
                     )
                     (ok true)
                 )
@@ -455,8 +460,8 @@
                         will-id: will-id,
                         beneficiary: beneficiary,
                     } {
-                        allocation: new-allocation,
-                        claimed: false,
+                            allocation: new-allocation,
+                            claimed: false,
                     })
                     (map-set wills { will-id: will-id }
                         (merge will-data {
@@ -464,9 +469,7 @@
                             beneficiary-count: (+ (get beneficiary-count will-data) u1),
                         })
                     )
-                    (log-will-updated will-id caller beneficiary u0
-                        new-allocation
-                    )
+                    (log-will-updated will-id caller beneficiary u0 new-allocation)
                     (ok true)
                 )
             )
@@ -599,19 +602,22 @@
             }))
             (current-block stacks-block-height)
         )
-        (if (and will-data beneficiary-data)
-            (let (
-                    (is-cancelled (get is-cancelled (unwrap! will-data false)))
-                    (release-block (get release-block-height (unwrap! will-data u0)))
-                    (claimed (get claimed (unwrap! beneficiary-data false)))
-                    (allocation (get allocation (unwrap! beneficiary-data u0)))
+        (match will-data
+            will-info (match beneficiary-data
+                beneficiary-info (let (
+                        (is-cancelled (get is-cancelled will-info))
+                        (release-block (get release-block-height will-info))
+                        (claimed (get claimed beneficiary-info))
+                        (allocation (get allocation beneficiary-info))
+                    )
+                    (and
+                        (not is-cancelled)
+                        (>= current-block release-block)
+                        (not claimed)
+                        (> allocation u0)
+                    )
                 )
-                (and
-                    (not is-cancelled)
-                    (>= current-block release-block)
-                    (not claimed)
-                    (> allocation u0)
-                )
+                false
             )
             false
         )
@@ -621,13 +627,12 @@
 ;; Get will stats (total allocation, claimed, beneficiary count)
 (define-read-only (get-will-stats (will-id uint))
     (match (map-get? wills { will-id: will-id })
-        will-data
-        {
+        will-data (some {
             total-allocation: (get total-allocation will-data),
             total-claimed: (get total-claimed will-data),
             beneficiary-count: (get beneficiary-count will-data),
             is-cancelled: (get is-cancelled will-data),
-        }
+        })
         none
     )
 )
