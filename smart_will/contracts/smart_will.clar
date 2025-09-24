@@ -550,3 +550,114 @@
         (ok claim-amount)
     )
 )
+
+;; ===================================================================
+;; READ-ONLY & QUERY FUNCTIONS
+;; ===================================================================
+
+;; Get will info by will-id
+(define-read-only (get-will-info (will-id uint))
+    (map-get? wills { will-id: will-id })
+)
+
+;; Get beneficiary info for a will
+(define-read-only (get-beneficiary-info
+        (will-id uint)
+        (beneficiary principal)
+    )
+    (map-get? beneficiary-allocations {
+        will-id: will-id,
+        beneficiary: beneficiary,
+    })
+)
+
+;; Get will-id for an owner
+(define-read-only (get-owner-will-id (owner principal))
+    (map-get? owner-will-mapping { owner: owner })
+)
+
+;; Check if release condition is met for a will
+(define-read-only (is-release-condition-met (will-id uint))
+    (is-release-condition-met-internal will-id)
+)
+
+;; Get the current will counter
+(define-read-only (get-will-counter)
+    (var-get will-counter)
+)
+
+;; Can the beneficiary claim from this will?
+(define-read-only (can-claim
+        (will-id uint)
+        (beneficiary principal)
+    )
+    (let (
+            (will-data (map-get? wills { will-id: will-id }))
+            (beneficiary-data (map-get? beneficiary-allocations {
+                will-id: will-id,
+                beneficiary: beneficiary,
+            }))
+            (current-block stacks-block-height)
+        )
+        (if (and will-data beneficiary-data)
+            (let (
+                    (is-cancelled (get is-cancelled (unwrap! will-data false)))
+                    (release-block (get release-block-height (unwrap! will-data u0)))
+                    (claimed (get claimed (unwrap! beneficiary-data false)))
+                    (allocation (get allocation (unwrap! beneficiary-data u0)))
+                )
+                (and
+                    (not is-cancelled)
+                    (>= current-block release-block)
+                    (not claimed)
+                    (> allocation u0)
+                )
+            )
+            false
+        )
+    )
+)
+
+;; Get will stats (total allocation, claimed, beneficiary count)
+(define-read-only (get-will-stats (will-id uint))
+    (match (map-get? wills { will-id: will-id })
+        will-data
+        {
+            total-allocation: (get total-allocation will-data),
+            total-claimed: (get total-claimed will-data),
+            beneficiary-count: (get beneficiary-count will-data),
+            is-cancelled: (get is-cancelled will-data),
+        }
+        none
+    )
+)
+
+;; Get contract STX balance
+(define-read-only (get-contract-balance)
+    (stx-get-balance (as-contract tx-sender))
+)
+
+;; Get last will created event
+(define-read-only (get-last-will-created-event)
+    (var-get last-will-created-event)
+)
+
+;; Get last will updated event
+(define-read-only (get-last-will-updated-event)
+    (var-get last-will-updated-event)
+)
+
+;; Get last will cancelled event
+(define-read-only (get-last-will-cancelled-event)
+    (var-get last-will-cancelled-event)
+)
+
+;; Get last claim event
+(define-read-only (get-last-claim-event)
+    (var-get last-claim-event)
+)
+
+;; Validate no duplicate beneficiaries in a list (utility)
+(define-read-only (validate-no-duplicates (beneficiaries (list 50 principal)))
+    (not (has-duplicate-beneficiaries beneficiaries))
+)
